@@ -1,0 +1,12 @@
+# Dependencies
+node_modules/
+
+# Environment variables
+.env
+*.env
+
+# macOS artifacts
+.DS_Store
+
+# Supabase artifacts
+.supabase/
