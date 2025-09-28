@@ -42,7 +42,7 @@ interface InviteRecord {
   source_subject: string | null;
 }
 
-function shouldSendDigest(now: DateTime, timezone: string): boolean {
+export function shouldSendDigest(now: DateTime, timezone: string): boolean {
   if (!timezone) return false;
 
   const local = now.setZone(timezone);
@@ -51,7 +51,7 @@ function shouldSendDigest(now: DateTime, timezone: string): boolean {
   return local.hour === 7;
 }
 
-function formatTimeRange(
+export function formatTimeRange(
   start?: string,
   end?: string,
   timezone?: string,
@@ -76,7 +76,7 @@ function formatTimeRange(
   }
 }
 
-function buildDigestBody(
+export function buildDigestBody(
   user: UserRecord,
   invites: Array<
     { record: InviteRecord; parsed: z.infer<typeof InviteSchema> }
@@ -155,7 +155,7 @@ async function deliverDigest(
   }
 }
 
-Deno.serve(async (req) => {
+export async function sendDigestHandler(req: Request): Promise<Response> {
   const supabase = getSupabaseAdminClient();
 
   if (req.method !== "POST") {
@@ -322,4 +322,8 @@ Deno.serve(async (req) => {
     digestsSent: sent,
     dryRun,
   });
-});
+}
+
+if (import.meta.main) {
+  Deno.serve(sendDigestHandler);
+}

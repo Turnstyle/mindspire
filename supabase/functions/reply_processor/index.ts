@@ -5,7 +5,7 @@ import { logEvent } from "../_shared/logger.ts";
 import { callGeminiJson } from "../_shared/google.ts";
 import { getOptionalEnv } from "../_shared/env.ts";
 
-const BodySchema = z.object({
+export const BodySchema = z.object({
   userId: z.string().uuid(),
   emailText: z.string().min(1),
   gmailMessageId: z.string().optional(),
@@ -13,7 +13,7 @@ const BodySchema = z.object({
   dryRun: z.boolean().optional(),
 });
 
-const GeminiReplySchema = z.object({
+export const GeminiReplySchema = z.object({
   id: z.string().min(1),
   decision: z.enum(["yes", "no", "maybe"]),
   notes: z.string().optional(),
@@ -25,7 +25,7 @@ const DecisionToStatus: Record<"yes" | "no" | "maybe", string> = {
   maybe: "pending",
 };
 
-function buildReplyPrompt(emailText: string): string {
+export function buildReplyPrompt(emailText: string): string {
   return `Extract the invite decision and optional notes from this email reply.
 Return strict JSON with fields: id (string), decision (yes|no|maybe), notes (string, optional).
 Email:
@@ -61,7 +61,7 @@ async function notifyPeer(body: Record<string, unknown>, dryRun: boolean) {
   }
 }
 
-Deno.serve(async (req) => {
+export async function replyProcessorHandler(req: Request): Promise<Response> {
   const supabase = getSupabaseAdminClient();
 
   if (req.method !== "POST") {
@@ -184,4 +184,8 @@ Deno.serve(async (req) => {
     inviteId: invite.id,
     decision: parsedReply.decision,
   });
-});
+}
+
+if (import.meta.main) {
+  Deno.serve(replyProcessorHandler);
+}

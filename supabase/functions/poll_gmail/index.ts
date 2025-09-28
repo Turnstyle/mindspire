@@ -30,7 +30,12 @@ class GoogleAuthError extends Error {
   }
 }
 
-const MessagePartSchema: z.ZodType<any> = z.lazy(() =>
+const MessagePartSchema: z.ZodType<{
+  mimeType?: string;
+  filename?: string;
+  body?: { data?: string; size?: number };
+  parts?: Array<z.infer<typeof MessagePartSchema>>;
+}> = z.lazy(() =>
   z.object({
     mimeType: z.string().optional(),
     filename: z.string().optional(),
@@ -92,7 +97,7 @@ const BodySchema = z.object({
   dryRun: z.boolean().optional(),
 });
 
-function decodeBase64Url(input: string | undefined): string {
+export function decodeBase64Url(input: string | undefined): string {
   if (!input) return "";
   const normalized = input.replace(/-/g, "+").replace(/_/g, "/");
   const padded = normalized.padEnd(
@@ -108,7 +113,7 @@ function decodeBase64Url(input: string | undefined): string {
   }
 }
 
-function extractPlainText(
+export function extractPlainText(
   payload: z.infer<typeof MessageSchema>["payload"],
 ): string {
   if (payload.body?.data) {
@@ -196,7 +201,10 @@ async function fetchHistory(
   return HistoryResponseSchema.parse(json);
 }
 
-function buildInvitePrompt(emailText: string, userEmail: string): string {
+export function buildInvitePrompt(
+  emailText: string,
+  userEmail: string,
+): string {
   return `You are an assistant that extracts calendar invitation proposals from Gmail messages for the user ${userEmail}.
 Return a compact JSON object with this exact shape:
 {
@@ -481,7 +489,7 @@ async function processUser(
   }
 }
 
-Deno.serve(async (req) => {
+export async function pollGmailHandler(req: Request): Promise<Response> {
   const supabase = getSupabaseAdminClient();
 
   if (req.method !== "POST") {
@@ -569,4 +577,8 @@ Deno.serve(async (req) => {
     message: "Poll complete",
     usersProcessed: filteredCredentials.length,
   });
-});
+}
+
+if (import.meta.main) {
+  Deno.serve(pollGmailHandler);
+}

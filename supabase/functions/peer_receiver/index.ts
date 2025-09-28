@@ -5,7 +5,7 @@ import { getSupabaseAdminClient } from "../_shared/supabaseClient.ts";
 import { logEvent } from "../_shared/logger.ts";
 import { getRequiredEnv } from "../_shared/env.ts";
 
-const BodySchema = z.object({
+export const BodySchema = z.object({
   type: z.string(),
   invite_id: z.string().optional(),
   decision: z.string().optional(),
@@ -20,7 +20,7 @@ async function verifyJwt(token: string) {
   return payload;
 }
 
-Deno.serve(async (req) => {
+export async function peerReceiverHandler(req: Request): Promise<Response> {
   const supabase = getSupabaseAdminClient();
 
   if (req.method !== "POST") {
@@ -65,4 +65,8 @@ Deno.serve(async (req) => {
   });
 
   return jsonResponse({ status: "ok" });
-});
+}
+
+if (import.meta.main) {
+  Deno.serve(peerReceiverHandler);
+}

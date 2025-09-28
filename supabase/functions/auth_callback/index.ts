@@ -140,7 +140,7 @@ async function fetchCalendarTimezone(accessToken: string) {
   return CalendarTimezoneSchema.parse(json);
 }
 
-Deno.serve(async (req) => {
+export async function authCallbackHandler(req: Request): Promise<Response> {
   const supabase = getSupabaseAdminClient();
   const url = new URL(req.url);
   const authError = url.searchParams.get("error");
@@ -331,4 +331,8 @@ Deno.serve(async (req) => {
 
     return jsonResponse({ error: message }, { status: 500 });
   }
-});
+}
+
+if (import.meta.main) {
+  Deno.serve(authCallbackHandler);
+}
