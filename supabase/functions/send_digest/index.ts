@@ -141,12 +141,16 @@ async function deliverDigest(
     return;
   }
 
+  const payload = webhook.includes("hooks.slack.com")
+    ? { text: `*Mindspire digest for ${email}*\n\n${body}` }
+    : { email, body };
+
   const response = await fetch(webhook, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ email, body }),
+    body: JSON.stringify(payload),
   });
 
   if (!response.ok) {
