@@ -57,8 +57,8 @@ the service role.
 1. Install [Supabase CLI](https://supabase.com/docs/guides/cli) and Docker
    Desktop.
 2. Run `supabase start` within the repository.
-3. Start functions locally:
-   `supabase functions serve --env-file .env --no-verify-jwt`.
+3. Start functions locally (imports are resolved via the project import map):
+   `supabase functions serve --env-file .env --import-map supabase/functions/import_map.json --no-verify-jwt`.
 4. Invoke a function, e.g.:
    ```bash
    curl -X POST http://localhost:54321/functions/v1/poll_gmail \
