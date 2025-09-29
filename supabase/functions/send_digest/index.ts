@@ -66,11 +66,11 @@ export function formatTimeRange(
 
     if (endDt && endDt.isValid) {
       return `${startDt.toFormat("ccc MMM d h:mm a")} – ${
-        endDt.toFormat("h:mm a z")
+        endDt.toFormat("h:mm a ZZZZ")
       }`;
     }
 
-    return `${startDt.toFormat("ccc MMM d h:mm a z")}`;
+    return `${startDt.toFormat("ccc MMM d h:mm a ZZZZ")}`;
   } catch (_error) {
     return "";
   }

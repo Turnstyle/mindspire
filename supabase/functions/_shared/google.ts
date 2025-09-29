@@ -1,4 +1,5 @@
 import { importPKCS8, SignJWT } from "jose";
+import type { KeyLike } from "jose";
 import { z } from "zod";
 import { getOptionalEnv, getRequiredEnv } from "./env.ts";
 
@@ -26,9 +27,9 @@ const GeminiResponseSchema = z.object({
   })).min(1),
 });
 
-let cachedPrivateKey: CryptoKey | null = null;
+let cachedPrivateKey: KeyLike | null = null;
 
-async function getPrivateKey(): Promise<CryptoKey> {
+async function getPrivateKey(): Promise<KeyLike> {
   if (cachedPrivateKey) return cachedPrivateKey;
 
   const privateKeyPem = getRequiredEnv("GOOGLE_PRIVATE_KEY").replaceAll(
