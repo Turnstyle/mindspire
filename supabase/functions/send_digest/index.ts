@@ -4,6 +4,7 @@ import { jsonResponse } from "../_shared/http.ts";
 import { getSupabaseAdminClient } from "../_shared/supabaseClient.ts";
 import { logEvent } from "../_shared/logger.ts";
 import { getOptionalEnv } from "../_shared/env.ts";
+import { SmtpClient } from "smtp";
 
 const InviteSchema = z.object({
   invite_id: z.string().min(1),
@@ -135,27 +136,85 @@ async function deliverDigest(
   dryRun: boolean,
 ) {
   const webhook = getOptionalEnv("DIGEST_WEBHOOK_URL");
-  if (!webhook) {
-    if (dryRun) return;
-    console.warn("DIGEST_WEBHOOK_URL not configured; skipping send", { email });
+  if (webhook) {
+    const payload = webhook.includes("hooks.slack.com")
+      ? { text: `*Mindspire digest for ${email}*\n\n${body}` }
+      : { email, body };
+
+    const response = await fetch(webhook, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Digest webhook failed: ${response.status} ${text}`);
+    }
+
+    await logEvent(getSupabaseAdminClient(), "info", "send_digest:slack_posted", {
+      email,
+    });
+  } else if (!dryRun) {
+    console.warn("DIGEST_WEBHOOK_URL not configured; skipping Slack post", { email });
+  }
+
+  await maybeSendEmail(email, body, dryRun);
+}
+
+async function maybeSendEmail(email: string, body: string, dryRun: boolean) {
+  if (dryRun) return;
+
+  const host = getOptionalEnv("SMTP_HOST");
+  const portValue = getOptionalEnv("SMTP_PORT") ?? "465";
+  const username = getOptionalEnv("SMTP_USER");
+  const password = getOptionalEnv("SMTP_PASS");
+
+  if (!host || !username || !password) {
     return;
   }
 
-  const payload = webhook.includes("hooks.slack.com")
-    ? { text: `*Mindspire digest for ${email}*\n\n${body}` }
-    : { email, body };
+  const port = Number.parseInt(portValue, 10);
+  if (Number.isNaN(port)) {
+    console.warn("Invalid SMTP_PORT; skipping email send", { portValue });
+    return;
+  }
 
-  const response = await fetch(webhook, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-  });
+  const fromAddress = getOptionalEnv("SMTP_FROM") ?? username;
+  const client = new SmtpClient();
 
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Digest webhook failed: ${response.status} ${text}`);
+  try {
+    await client.connectTLS({
+      hostname: host,
+      port,
+      username,
+      password,
+    });
+
+    await client.send({
+      from: fromAddress,
+      to: email,
+      subject: "Your Mindspire digest",
+      content: body,
+    });
+
+    await logEvent(getSupabaseAdminClient(), "info", "send_digest:email_sent", {
+      email,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await logEvent(getSupabaseAdminClient(), "error", "send_digest:email_failed", {
+      email,
+      error: message,
+    });
+  } finally {
+    try {
+      await client.close();
+    } catch (_) {
+      // ignore close errors
+    }
   }
 }
 
