@@ -109,14 +109,11 @@ export async function replyProcessorHandler(req: Request): Promise<Response> {
 
   const status = DecisionToStatus[parsedReply.decision];
 
-  const { data: invite, error: inviteError } = await supabase
+  const { data: inviteCandidates, error: inviteError } = await supabase
     .from("invite")
-    .select("id, parsed, status, user_id")
-    .eq("user_id", body.userId)
+    .select("id, parsed, status, user_id, shared_user_ids")
     .contains("parsed", { invite_id: parsedReply.id })
-    .order("created_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
+    .order("created_at", { ascending: false });
 
   if (inviteError) {
     await logEvent(supabase, "error", "reply_processor:invite_lookup_failed", {
@@ -126,6 +123,12 @@ export async function replyProcessorHandler(req: Request): Promise<Response> {
     });
     return jsonResponse({ error: "Invite lookup failed" }, { status: 500 });
   }
+
+  const invite = (inviteCandidates ?? []).find((candidate) => {
+    if (candidate.user_id === body.userId) return true;
+    if (!candidate.shared_user_ids) return false;
+    return candidate.shared_user_ids.includes(body.userId);
+  });
 
   if (!invite) {
     await logEvent(supabase, "warn", "reply_processor:invite_not_found", {

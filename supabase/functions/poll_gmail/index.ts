@@ -97,6 +97,26 @@ const BodySchema = z.object({
   dryRun: z.boolean().optional(),
 });
 
+function extractRecipientEmails(
+  headers: Array<{ name: string; value: string }> | undefined,
+): Set<string> {
+  const recipients = new Set<string>();
+  if (!headers) return recipients;
+
+  const targetHeaders = ["to", "cc", "bcc"];
+  const emailRegex = /([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})/gi;
+
+  for (const header of headers) {
+    if (!targetHeaders.includes(header.name.toLowerCase())) continue;
+    const matches = header.value?.match(emailRegex) ?? [];
+    for (const match of matches) {
+      recipients.add(match.toLowerCase());
+    }
+  }
+
+  return recipients;
+}
+
 export function decodeBase64Url(input: string | undefined): string {
   if (!input) return "";
   const normalized = input.replace(/-/g, "+").replace(/_/g, "/");
@@ -290,6 +310,7 @@ async function processUser(
   user: UserRow,
   credential: CredentialRow,
   dryRun: boolean,
+  userMap: Map<string, UserRow>,
 ) {
   const accessTokenPath = `mindspire/${user.id}/google/access`;
   const refreshTokenPath = `mindspire/${user.id}/google/refresh`;
@@ -390,6 +411,10 @@ async function processUser(
     return;
   }
 
+  const partner = user.partner_user_id
+    ? userMap.get(user.partner_user_id) ?? null
+    : null;
+
   for (const { id: messageId, threadId } of messageMap.values()) {
     try {
       const message = await fetchMessage(accessToken, messageId);
@@ -410,6 +435,14 @@ async function processUser(
       const subject = message.payload.headers?.find((header) =>
         header.name.toLowerCase() === "subject"
       )?.value ?? invite.title;
+
+      const recipients = extractRecipientEmails(message.payload.headers);
+      const sharedUserIds = new Set<string>();
+      if (partner && recipients.has(partner.email.toLowerCase())) {
+        sharedUserIds.add(partner.id);
+      }
+      // The owner is implicit via user_id; ensure we never persist duplicates.
+      sharedUserIds.delete(user.id);
 
       if (dryRun) {
         await logEvent(supabase, "info", "poll_gmail:dry_run_invite", {
@@ -440,6 +473,52 @@ async function processUser(
         continue;
       }
 
+      const { data: relatedInvite, error: relatedError } = await supabase
+        .from("invite")
+        .select("id, user_id, shared_user_ids")
+        .eq("gmail_thread_id", threadId)
+        .limit(1)
+        .maybeSingle();
+
+      if (relatedError) {
+        throw new Error(
+          `Failed to look up related invite: ${relatedError.message}`,
+        );
+      }
+
+      if (relatedInvite) {
+        const mergedShared = new Set(relatedInvite.shared_user_ids ?? []);
+        if (relatedInvite.user_id !== user.id) {
+          mergedShared.add(user.id);
+        }
+        for (const sharedId of sharedUserIds) {
+          mergedShared.add(sharedId);
+        }
+
+        if (mergedShared.size !==
+          (relatedInvite.shared_user_ids?.length ?? 0)
+        ) {
+          const { error: updateError } = await supabase
+            .from("invite")
+            .update({ shared_user_ids: Array.from(mergedShared) })
+            .eq("id", relatedInvite.id);
+
+          if (updateError) {
+            throw new Error(
+              `Failed to update shared invite: ${updateError.message}`,
+            );
+          }
+
+          await logEvent(supabase, "info", "poll_gmail:invite_shared_updated", {
+            inviteId: relatedInvite.id,
+            messageId,
+            addedUserId: user.id,
+          });
+        }
+
+        continue;
+      }
+
       const { error: insertError } = await supabase
         .from("invite")
         .insert({
@@ -448,6 +527,7 @@ async function processUser(
           gmail_message_id: messageId,
           source_subject: subject,
           parsed: invite,
+          shared_user_ids: Array.from(sharedUserIds),
           status: "pending",
         });
 
@@ -548,6 +628,24 @@ export async function pollGmailHandler(req: Request): Promise<Response> {
     (users ?? []).map((user) => [user.id, user] as [string, UserRow]),
   );
 
+  const missingPartnerIds = new Set<string>();
+  for (const user of userMap.values()) {
+    if (user.partner_user_id && !userMap.has(user.partner_user_id)) {
+      missingPartnerIds.add(user.partner_user_id);
+    }
+  }
+
+  if (missingPartnerIds.size > 0) {
+    const { data: partners } = await supabase
+      .from("app_user")
+      .select("id, email, tz, partner_user_id")
+      .in("id", Array.from(missingPartnerIds));
+
+    for (const partner of partners ?? []) {
+      userMap.set(partner.id, partner as UserRow);
+    }
+  }
+
   for (const credential of filteredCredentials) {
     const user = userMap.get(credential.user_id);
     if (!user) {
@@ -563,6 +661,7 @@ export async function pollGmailHandler(req: Request): Promise<Response> {
         user,
         credential as CredentialRow,
         !!body.dryRun,
+        userMap,
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

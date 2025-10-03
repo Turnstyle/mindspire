@@ -32,6 +32,7 @@ interface UserRecord {
   id: string;
   email: string;
   tz: string;
+  partner_user_id: string | null;
 }
 
 interface InviteRecord {
@@ -41,6 +42,8 @@ interface InviteRecord {
   gmail_thread_id: string;
   gmail_message_id: string;
   source_subject: string | null;
+  user_id: string;
+  shared_user_ids: string[] | null;
 }
 
 export function shouldSendDigest(now: DateTime, timezone: string): boolean {
@@ -77,11 +80,16 @@ export function formatTimeRange(
   }
 }
 
+function buildThreadLink(threadId: string): string {
+  return `https://mail.google.com/mail/u/0/#inbox/${threadId}`;
+}
+
 export function buildDigestBody(
   user: UserRecord,
   invites: Array<
     { record: InviteRecord; parsed: z.infer<typeof InviteSchema> }
   >,
+  ownerEmailLookup: Map<string, string>,
 ): { text: string; items: Array<Record<string, unknown>> } {
   const lines: string[] = [];
   const items: Array<Record<string, unknown>> = [];
@@ -108,11 +116,18 @@ export function buildDigestBody(
       lines.push(`   ${meta.join(" · ")}`);
     }
 
+    const ownerEmail = ownerEmailLookup.get(record.user_id);
+    if (record.user_id !== user.id && ownerEmail) {
+      lines.push(`   Owner: ${ownerEmail}`);
+    }
+
     lines.push(`   ${parsed.summary}`);
 
     if (parsed.follow_up_actions.length > 0) {
       lines.push(`   Next steps: ${parsed.follow_up_actions.join(", ")}`);
     }
+
+    lines.push(`   Email thread: ${buildThreadLink(record.gmail_thread_id)}`);
 
     lines.push("");
 
@@ -244,7 +259,7 @@ export async function sendDigestHandler(req: Request): Promise<Response> {
 
   const { data: users, error: usersError } = await supabase
     .from("app_user")
-    .select("id, email, tz")
+    .select("id, email, tz, partner_user_id")
     .order("id");
 
   if (usersError) {
@@ -254,7 +269,13 @@ export async function sendDigestHandler(req: Request): Promise<Response> {
     return jsonResponse({ error: "Failed to load users" }, { status: 500 });
   }
 
-  const filteredUsers = (users ?? []).filter((user) =>
+  const userRecords = users ?? [];
+
+  const ownerEmailLookup = new Map<string, string>(
+    userRecords.map((entry) => [entry.id, entry.email] as [string, string]),
+  );
+
+  const filteredUsers = userRecords.filter((user) =>
     body.userId ? user.id === body.userId : true
   );
 
@@ -295,13 +316,16 @@ export async function sendDigestHandler(req: Request): Promise<Response> {
       }
     }
 
+    const participationFilter =
+      `user_id.eq.${user.id},shared_user_ids.cs.{"${user.id}"}`;
+
     const { data: invites, error: invitesError } = await supabase
       .from("invite")
       .select(
-        "id, parsed, created_at, gmail_thread_id, gmail_message_id, source_subject",
+        "id, parsed, created_at, gmail_thread_id, gmail_message_id, source_subject, user_id, shared_user_ids",
       )
-      .eq("user_id", user.id)
       .eq("status", "pending")
+      .or(participationFilter)
       .order("created_at", { ascending: true });
 
     if (invitesError) {
@@ -337,7 +361,7 @@ export async function sendDigestHandler(req: Request): Promise<Response> {
       continue;
     }
 
-    const digestBody = buildDigestBody(user, parsedInvites);
+    const digestBody = buildDigestBody(user, parsedInvites, ownerEmailLookup);
 
     if (!dryRun) {
       try {

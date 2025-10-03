@@ -28,7 +28,12 @@ Deno.test("formatTimeRange formats start/end spans", () => {
 });
 
 Deno.test("buildDigestBody composes items", () => {
-  const user = { id: "u1", email: "alex@example.com", tz: "America/New_York" };
+  const user = {
+    id: "u1",
+    email: "alex@example.com",
+    tz: "America/New_York",
+    partner_user_id: "u2",
+  };
   const parsed = {
     invite_id: "1A",
     title: "Dinner with Sam",
@@ -55,13 +60,22 @@ Deno.test("buildDigestBody composes items", () => {
       gmail_thread_id: "thread-1",
       gmail_message_id: "message-1",
       source_subject: "Dinner?",
+      user_id: "u2",
+      shared_user_ids: ["u1"],
     },
     parsed,
   }];
 
-  const digest = buildDigestBody(user, invites);
+  const ownerLookup = new Map<string, string>([
+    ["u1", "alex@example.com"],
+    ["u2", "julie@example.com"],
+  ]);
+
+  const digest = buildDigestBody(user, invites, ownerLookup);
   assertStringIncludes(digest.text, "Dinner with Sam");
   assertStringIncludes(digest.text, "Confirm headcount");
+  assertStringIncludes(digest.text, "Owner: julie@example.com");
+  assertStringIncludes(digest.text, "Email thread:");
   assertEquals(digest.items.length, 1);
   assertEquals(digest.items[0].invite_id, "1A");
 });
