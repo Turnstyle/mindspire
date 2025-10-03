@@ -11,6 +11,7 @@ const RefreshSchema = z.object({
   scope: z.string().optional(),
   token_type: z.string(),
   id_token: z.string().optional(),
+  refresh_token: z.string().optional(),
 });
 
 const ServiceAccountTokenSchema = z.object({

@@ -2,7 +2,10 @@ import { z } from "zod";
 import { jsonResponse } from "../_shared/http.ts";
 import { getSupabaseAdminClient } from "../_shared/supabaseClient.ts";
 import { logEvent } from "../_shared/logger.ts";
-import { getSecret, upsertSecret } from "../_shared/vault.ts";
+import {
+  getTokenPair,
+  storeTokenPair,
+} from "../_shared/tokenStore.ts";
 import { callGeminiJson, refreshAccessToken } from "../_shared/google.ts";
 
 interface CredentialRow {
@@ -260,15 +263,18 @@ async function updateAccessToken(
   supabase: ReturnType<typeof getSupabaseAdminClient>,
   userId: string,
   refreshToken: string,
-): Promise<string> {
+): Promise<{ accessToken: string; refreshToken: string }> {
   const refreshed = await refreshAccessToken(refreshToken);
-  const accessTokenPath = `mindspire/${userId}/google/access`;
-  await upsertSecret(supabase, accessTokenPath, refreshed.access_token);
+  const nextRefreshToken = refreshed.refresh_token ?? refreshToken;
+  await storeTokenPair(supabase, userId, {
+    accessToken: refreshed.access_token,
+    refreshToken: nextRefreshToken,
+  });
   await logEvent(supabase, "info", "poll_gmail:token_refreshed", {
     userId,
     scopes: refreshed.scope,
   });
-  return refreshed.access_token;
+  return { accessToken: refreshed.access_token, refreshToken: nextRefreshToken };
 }
 
 async function ensureAccessToken(
@@ -276,8 +282,10 @@ async function ensureAccessToken(
   userId: string,
   refreshToken: string,
   currentAccessToken: string | null,
-): Promise<string> {
-  if (currentAccessToken) return currentAccessToken;
+): Promise<{ accessToken: string; refreshToken: string }> {
+  if (currentAccessToken) {
+    return { accessToken: currentAccessToken, refreshToken };
+  }
   return await updateAccessToken(supabase, userId, refreshToken);
 }
 
@@ -312,10 +320,12 @@ async function processUser(
   dryRun: boolean,
   userMap: Map<string, UserRow>,
 ) {
-  const accessTokenPath = `mindspire/${user.id}/google/access`;
-  const refreshTokenPath = `mindspire/${user.id}/google/refresh`;
+  const tokens = await getTokenPair(supabase, user.id).catch(() => ({
+    accessToken: null,
+    refreshToken: null,
+  }));
 
-  const refreshToken = await getSecret(supabase, refreshTokenPath);
+  const refreshToken = tokens.refreshToken;
   if (!refreshToken) {
     await logEvent(supabase, "error", "poll_gmail:missing_refresh_token", {
       userId: user.id,
@@ -324,13 +334,14 @@ async function processUser(
     return;
   }
 
-  let accessToken = await getSecret(supabase, accessTokenPath);
-  accessToken = await ensureAccessToken(
+  const ensured = await ensureAccessToken(
     supabase,
     user.id,
     refreshToken,
-    accessToken,
+    tokens.accessToken,
   );
+  let accessToken = ensured.accessToken;
+  let activeRefreshToken = ensured.refreshToken;
 
   let historyResponse: z.infer<typeof HistoryResponseSchema> | null = null;
   let requiresCursorReset = false;
@@ -342,7 +353,13 @@ async function processUser(
     );
   } catch (error) {
     if (error instanceof GoogleAuthError && error.status === 401) {
-      accessToken = await updateAccessToken(supabase, user.id, refreshToken);
+      const refreshed = await updateAccessToken(
+        supabase,
+        user.id,
+        activeRefreshToken,
+      );
+      accessToken = refreshed.accessToken;
+      activeRefreshToken = refreshed.refreshToken;
       historyResponse = await fetchHistory(
         accessToken,
         credential.last_history_id,

@@ -7,7 +7,7 @@ import {
 import { getSupabaseAdminClient } from "../_shared/supabaseClient.ts";
 import { logEvent } from "../_shared/logger.ts";
 import { getOptionalEnv, getRequiredEnv } from "../_shared/env.ts";
-import { upsertSecret } from "../_shared/vault.ts";
+import { getTokenPair, storeTokenPair } from "../_shared/tokenStore.ts";
 
 interface OAuthState {
   userId?: string;
@@ -267,40 +267,37 @@ export async function authCallbackHandler(req: Request): Promise<Response> {
       );
     }
 
-    const accessTokenPath = `mindspire/${userId}/google/access`;
-    const refreshTokenPath = `mindspire/${userId}/google/refresh`;
+    const existingTokens = await getTokenPair(supabase, userId).catch(() => ({
+      accessToken: null,
+      refreshToken: null,
+    }));
 
-    const accessTokenVaultId = await upsertSecret(
-      supabase,
-      accessTokenPath,
-      tokens.access_token,
-    );
+    const refreshTokenValue = tokens.refresh_token ??
+      existingTokens.refreshToken ?? null;
 
-    let refreshTokenVaultId = existingCredentials
-      ?.google_refresh_token_vault_id as
-        | string
-        | undefined;
+    await storeTokenPair(supabase, userId, {
+      accessToken: tokens.access_token,
+      refreshToken: refreshTokenValue,
+    });
 
-    if (tokens.refresh_token) {
-      refreshTokenVaultId = await upsertSecret(
-        supabase,
-        refreshTokenPath,
-        tokens.refresh_token,
-      );
-    }
-
-    if (!refreshTokenVaultId) {
+    if (!refreshTokenValue) {
       await logEvent(supabase, "warn", "auth_callback:missing_refresh_token", {
         userId,
       });
     }
 
+    const accessTokenIdentifier = existingCredentials?.google_access_token_vault_id ??
+      userId;
+    const refreshTokenIdentifier = refreshTokenValue
+      ? existingCredentials?.google_refresh_token_vault_id ?? userId
+      : existingCredentials?.google_refresh_token_vault_id ?? null;
+
     const credentialsPayload = {
       id: existingCredentials?.id ?? userId,
       user_id: userId,
-      google_access_token_vault_id: accessTokenVaultId,
-      google_refresh_token_vault_id: refreshTokenVaultId,
-      needs_reauth: !refreshTokenVaultId,
+      google_access_token_vault_id: accessTokenIdentifier,
+      google_refresh_token_vault_id: refreshTokenIdentifier,
+      needs_reauth: !refreshTokenValue,
     };
 
     const { error: credentialsUpsertError } = await supabase

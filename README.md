@@ -37,6 +37,7 @@ GOOGLE_GEMINI_MODEL=gemini-2.5-flash-lite
 DIGEST_WEBHOOK_URL=... (temporary webhook or logging sink)
 PEER_WEBHOOK_URL=...
 PEER_JWT_SECRET=...
+TOKEN_ENCRYPTION_KEY=32-character-secret
 ```
 
 ## Database Setup
