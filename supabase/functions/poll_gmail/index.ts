@@ -7,6 +7,7 @@ import {
   storeTokenPair,
 } from "../_shared/tokenStore.ts";
 import { callGeminiJson, refreshAccessToken } from "../_shared/google.ts";
+import { getOptionalEnv } from "../_shared/env.ts";
 
 interface CredentialRow {
   id: string;
@@ -77,6 +78,7 @@ const HistoryResponseSchema = z.object({
     })).optional(),
   })).optional(),
   historyId: z.string().optional(),
+  nextPageToken: z.string().optional(),
 });
 
 const GeminiInviteSchema = z.object({
@@ -197,6 +199,7 @@ async function fetchMessage(accessToken: string, messageId: string) {
 async function fetchHistory(
   accessToken: string,
   startHistoryId?: string | null,
+  pageToken?: string,
 ) {
   const params = new URLSearchParams({
     labelId: "INBOX",
@@ -205,6 +208,10 @@ async function fetchHistory(
 
   if (startHistoryId) {
     params.set("startHistoryId", startHistoryId);
+  }
+
+  if (pageToken) {
+    params.set("pageToken", pageToken);
   }
 
   const url =
@@ -222,6 +229,71 @@ async function fetchHistory(
 
   const json = await response.json();
   return HistoryResponseSchema.parse(json);
+}
+
+function shouldFlagReauth(error: unknown): boolean {
+  if (error instanceof GoogleAuthError) {
+    return error.status === 400 || error.status === 401;
+  }
+
+  if (!(error instanceof Error)) return false;
+  const message = error.message.toLowerCase();
+  return message.includes("invalid_grant") || message.includes("invalid_client") || message.includes("status 400") || message.includes("status 401");
+}
+
+async function sendReauthNotification(
+  supabase: ReturnType<typeof getSupabaseAdminClient>,
+  userId: string | null,
+  userEmail: string | null,
+  reason: string,
+) {
+  if (!userId) return;
+
+  const webhook = getOptionalEnv("REAUTH_WEBHOOK_URL") ??
+    getOptionalEnv("DIGEST_WEBHOOK_URL");
+  if (!webhook) return;
+
+  const message = userEmail
+    ? `:warning: Mindspire needs Google reauth for ${userEmail} (${userId}). Reason: ${reason}`
+    : `:warning: Mindspire needs Google reauth for user ${userId}. Reason: ${reason}`;
+
+  const payload = webhook.includes("hooks.slack.com")
+    ? { text: message }
+    : { message, userId, email: userEmail, reason };
+
+  try {
+    const response = await fetch(webhook, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      await logEvent(supabase, "error", "poll_gmail:reauth_notification_failed", {
+        userId,
+        email: userEmail,
+        reason,
+        status: response.status,
+        body: text,
+      });
+    } else {
+      await logEvent(supabase, "info", "poll_gmail:reauth_notification_sent", {
+        userId,
+        email: userEmail,
+      });
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await logEvent(supabase, "error", "poll_gmail:reauth_notification_error", {
+      userId,
+      email: userEmail,
+      reason,
+      error: message,
+    });
+  }
 }
 
 export function buildInvitePrompt(
@@ -262,55 +334,148 @@ async function parseInviteWithGemini(
 async function updateAccessToken(
   supabase: ReturnType<typeof getSupabaseAdminClient>,
   userId: string,
+  credentialId: string,
   refreshToken: string,
 ): Promise<{ accessToken: string; refreshToken: string }> {
-  const refreshed = await refreshAccessToken(refreshToken);
-  const nextRefreshToken = refreshed.refresh_token ?? refreshToken;
-  await storeTokenPair(supabase, userId, {
-    accessToken: refreshed.access_token,
-    refreshToken: nextRefreshToken,
-  });
-  await logEvent(supabase, "info", "poll_gmail:token_refreshed", {
-    userId,
-    scopes: refreshed.scope,
-  });
-  return { accessToken: refreshed.access_token, refreshToken: nextRefreshToken };
+  try {
+    const refreshed = await refreshAccessToken(refreshToken);
+    const nextRefreshToken = refreshed.refresh_token ?? refreshToken;
+    await storeTokenPair(supabase, userId, {
+      accessToken: refreshed.access_token,
+      refreshToken: nextRefreshToken,
+    });
+    await logEvent(supabase, "info", "poll_gmail:token_refreshed", {
+      userId,
+      scopes: refreshed.scope,
+    });
+    return {
+      accessToken: refreshed.access_token,
+      refreshToken: nextRefreshToken,
+    };
+  } catch (error) {
+    if (shouldFlagReauth(error)) {
+      const message = error instanceof Error ? error.message : String(error);
+      await flagReauth(
+        supabase,
+        credentialId,
+        `Refresh token refresh failed: ${message}`,
+        { userId },
+      );
+    }
+    throw error;
+  }
 }
 
 async function ensureAccessToken(
   supabase: ReturnType<typeof getSupabaseAdminClient>,
   userId: string,
+  credentialId: string,
   refreshToken: string,
   currentAccessToken: string | null,
 ): Promise<{ accessToken: string; refreshToken: string }> {
   if (currentAccessToken) {
     return { accessToken: currentAccessToken, refreshToken };
   }
-  return await updateAccessToken(supabase, userId, refreshToken);
+  return await updateAccessToken(supabase, userId, credentialId, refreshToken);
+}
+
+interface ReauthContext {
+  userId?: string;
+  userEmail?: string;
 }
 
 async function flagReauth(
   supabase: ReturnType<typeof getSupabaseAdminClient>,
   credentialId: string,
   reason: string,
+  context: ReauthContext = {},
 ) {
-  const { error } = await supabase
+  let resolvedUserId = context.userId ?? null;
+  let resolvedEmail = context.userEmail ?? null;
+
+  const { data: credentialRow, error: credentialFetchError } = await supabase
+    .from("user_credentials")
+    .select("user_id, needs_reauth")
+    .eq("id", credentialId)
+    .maybeSingle();
+
+  if (credentialFetchError) {
+    await logEvent(supabase, "error", "poll_gmail:flag_reauth_lookup_failed", {
+      credentialId,
+      reason,
+      error: credentialFetchError.message,
+    });
+    return;
+  }
+
+  if (!credentialRow) {
+    await logEvent(supabase, "warn", "poll_gmail:flag_reauth_missing_credential", {
+      credentialId,
+      reason,
+    });
+    return;
+  }
+
+  if (credentialRow.needs_reauth) {
+    await logEvent(supabase, "debug", "poll_gmail:flag_reauth_already_set", {
+      credentialId,
+      reason,
+    });
+    return;
+  }
+
+  if (!resolvedUserId && credentialRow.user_id) {
+    resolvedUserId = credentialRow.user_id as string;
+  }
+
+  const { error: updateError } = await supabase
     .from("user_credentials")
     .update({ needs_reauth: true })
     .eq("id", credentialId);
 
-  if (error) {
+  if (updateError) {
     await logEvent(supabase, "error", "poll_gmail:flag_reauth_failed", {
       credentialId,
       reason,
-      error: error.message,
+      error: updateError.message,
     });
-  } else {
-    await logEvent(supabase, "warn", "poll_gmail:flagged_reauth", {
-      credentialId,
-      reason,
-    });
+    return;
   }
+
+  if (!resolvedEmail && resolvedUserId) {
+    const { data: userRow, error: userFetchError } = await supabase
+      .from("app_user")
+      .select("email")
+      .eq("id", resolvedUserId)
+      .maybeSingle();
+
+    if (userFetchError) {
+      await logEvent(supabase, "error", "poll_gmail:flag_reauth_user_lookup_failed", {
+        credentialId,
+        userId: resolvedUserId,
+        reason,
+        error: userFetchError.message,
+      });
+    }
+
+    if (userRow?.email) {
+      resolvedEmail = userRow.email as string;
+    }
+  }
+
+  await logEvent(supabase, "warn", "poll_gmail:flagged_reauth", {
+    credentialId,
+    reason,
+    userId: resolvedUserId,
+    email: resolvedEmail,
+  });
+
+  await sendReauthNotification(
+    supabase,
+    resolvedUserId,
+    resolvedEmail ?? null,
+    reason,
+  );
 }
 
 async function processUser(
@@ -330,40 +495,75 @@ async function processUser(
     await logEvent(supabase, "error", "poll_gmail:missing_refresh_token", {
       userId: user.id,
     });
-    await flagReauth(supabase, credential.id, "Refresh token missing");
+    await flagReauth(
+      supabase,
+      credential.id,
+      "Refresh token missing",
+      { userId: user.id, userEmail: user.email },
+    );
     return;
   }
 
   const ensured = await ensureAccessToken(
     supabase,
     user.id,
+    credential.id,
     refreshToken,
     tokens.accessToken,
   );
   let accessToken = ensured.accessToken;
   let activeRefreshToken = ensured.refreshToken;
 
-  let historyResponse: z.infer<typeof HistoryResponseSchema> | null = null;
+  let historyMessages: Map<string, { id: string; threadId: string }> | null = null;
+  let latestHistoryId: string | null = credential.last_history_id ?? null;
   let requiresCursorReset = false;
 
+  const loadHistoryMessages = async () => {
+    const messageMap = new Map<string, { id: string; threadId: string }>();
+    let pageToken: string | undefined;
+
+    do {
+      const page = await fetchHistory(
+        accessToken,
+        credential.last_history_id,
+        pageToken,
+      );
+
+      if (page.history) {
+        for (const history of page.history) {
+          if (!history.messages) continue;
+          for (const message of history.messages) {
+            messageMap.set(message.id, {
+              id: message.id,
+              threadId: message.threadId,
+            });
+          }
+        }
+      }
+
+      if (page.historyId) {
+        latestHistoryId = page.historyId;
+      }
+
+      pageToken = page.nextPageToken ?? undefined;
+    } while (pageToken);
+
+    return messageMap;
+  };
+
   try {
-    historyResponse = await fetchHistory(
-      accessToken,
-      credential.last_history_id,
-    );
+    historyMessages = await loadHistoryMessages();
   } catch (error) {
     if (error instanceof GoogleAuthError && error.status === 401) {
       const refreshed = await updateAccessToken(
         supabase,
         user.id,
+        credential.id,
         activeRefreshToken,
       );
       accessToken = refreshed.accessToken;
       activeRefreshToken = refreshed.refreshToken;
-      historyResponse = await fetchHistory(
-        accessToken,
-        credential.last_history_id,
-      );
+      historyMessages = await loadHistoryMessages();
     } else if (error instanceof GoogleAuthError && error.status === 404) {
       requiresCursorReset = true;
     } else {
@@ -400,29 +600,13 @@ async function processUser(
     return;
   }
 
-  if (!historyResponse) return;
+  if (!historyMessages) return;
 
-  const historyItems = historyResponse.history ?? [];
-  const messageMap = new Map<string, { id: string; threadId: string }>();
-
-  for (const history of historyItems) {
-    if (!history.messages) continue;
-    for (const message of history.messages) {
-      messageMap.set(message.id, {
-        id: message.id,
-        threadId: message.threadId,
-      });
-    }
-  }
-
-  if (messageMap.size === 0) {
-    if (
-      historyResponse.historyId &&
-      historyResponse.historyId !== credential.last_history_id
-    ) {
+  if (historyMessages.size === 0) {
+    if (latestHistoryId && latestHistoryId !== credential.last_history_id) {
       await supabase
         .from("user_credentials")
-        .update({ last_history_id: historyResponse.historyId })
+        .update({ last_history_id: latestHistoryId })
         .eq("id", credential.id);
     }
     return;
@@ -432,7 +616,7 @@ async function processUser(
     ? userMap.get(user.partner_user_id) ?? null
     : null;
 
-  for (const { id: messageId, threadId } of messageMap.values()) {
+  for (const { id: messageId, threadId } of historyMessages.values()) {
     try {
       const message = await fetchMessage(accessToken, messageId);
       let emailText = extractPlainText(message.payload);
@@ -567,19 +751,16 @@ async function processUser(
     }
   }
 
-  if (
-    historyResponse.historyId &&
-    historyResponse.historyId !== credential.last_history_id
-  ) {
+  if (latestHistoryId && latestHistoryId !== credential.last_history_id) {
     const { error: cursorUpdateError } = await supabase
       .from("user_credentials")
-      .update({ last_history_id: historyResponse.historyId })
+      .update({ last_history_id: latestHistoryId })
       .eq("id", credential.id);
 
     if (cursorUpdateError) {
       await logEvent(supabase, "error", "poll_gmail:cursor_update_failed", {
         userId: user.id,
-        historyId: historyResponse.historyId,
+        historyId: latestHistoryId,
         error: cursorUpdateError.message,
       });
     }

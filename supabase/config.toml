@@ -89,3 +89,5 @@ otp_expiry = 3600
 [auth.sms]
 enable_signup = false
 
+[functions.invite_link]
+verify_jwt = false

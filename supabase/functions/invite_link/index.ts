@@ -3,6 +3,7 @@ import { htmlResponse, jsonResponse } from "../_shared/http.ts";
 import { getSupabaseAdminClient } from "../_shared/supabaseClient.ts";
 import { logEvent } from "../_shared/logger.ts";
 import { getOptionalEnv, getRequiredEnv } from "../_shared/env.ts";
+import { corsHeaders } from "../_shared/cors.ts";
 
 const GOOGLE_OAUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const DEFAULT_SCOPES = [
@@ -139,8 +140,15 @@ function renderHtml(inviteUrl: string, inviterEmail?: string): string {
 }
 
 export async function inviteLinkHandler(req: Request): Promise<Response> {
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: corsHeaders });
+  }
+
   if (req.method !== "GET" && req.method !== "POST") {
-    return jsonResponse({ error: "Method not allowed" }, { status: 405 });
+    return jsonResponse({ error: "Method not allowed" }, {
+      status: 405,
+      headers: corsHeaders,
+    });
   }
 
   const supabase = getSupabaseAdminClient();
@@ -150,7 +158,11 @@ export async function inviteLinkHandler(req: Request): Promise<Response> {
   try {
     if (req.method === "GET") {
       const url = new URL(req.url);
-      input = QuerySchema.parse(Object.fromEntries(url.searchParams));
+      const queryEntries: Record<string, string> = {};
+      url.searchParams.forEach((value, key) => {
+        queryEntries[key] = value;
+      });
+      input = QuerySchema.parse(queryEntries);
     } else {
       const json = await req.json();
       input = BodySchema.parse(json);
@@ -158,7 +170,10 @@ export async function inviteLinkHandler(req: Request): Promise<Response> {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     await logEvent(supabase, "warn", "invite_link:invalid_input", { message });
-    return jsonResponse({ error: "Invalid input", message }, { status: 400 });
+    return jsonResponse({ error: "Invalid input", message }, {
+      status: 400,
+      headers: corsHeaders,
+    });
   }
 
   let userContext: { userId: string; inviterEmail?: string } | null = null;
@@ -180,7 +195,10 @@ export async function inviteLinkHandler(req: Request): Promise<Response> {
       email: input.email,
       userId: input.userId,
     });
-    return jsonResponse({ error: "User not found" }, { status: 404 });
+    return jsonResponse({ error: "User not found" }, {
+      status: 404,
+      headers: corsHeaders,
+    });
   }
 
   const inviteUrl = buildInviteLink(userContext.userId, {
@@ -194,10 +212,12 @@ export async function inviteLinkHandler(req: Request): Promise<Response> {
   });
 
   if (input.format === "html") {
-    return htmlResponse(renderHtml(inviteUrl, userContext.inviterEmail));
+    return htmlResponse(renderHtml(inviteUrl, userContext.inviterEmail), {
+      headers: corsHeaders,
+    });
   }
 
-  return jsonResponse({ inviteUrl });
+  return jsonResponse({ inviteUrl }, { headers: corsHeaders });
 }
 
 if (import.meta.main) {

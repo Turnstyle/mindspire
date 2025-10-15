@@ -5,6 +5,7 @@ import { getSupabaseAdminClient } from "../_shared/supabaseClient.ts";
 import { logEvent } from "../_shared/logger.ts";
 import { getOptionalEnv } from "../_shared/env.ts";
 import { SmtpClient } from "smtp";
+import { sendEmailViaResend } from "../_shared/email.ts";
 
 const InviteSchema = z.object({
   invite_id: z.string().min(1),
@@ -182,6 +183,22 @@ async function deliverDigest(
 async function maybeSendEmail(email: string, body: string, dryRun: boolean) {
   if (dryRun) return;
 
+  const resendKey = getOptionalEnv("RESEND_API_KEY");
+  if (resendKey) {
+    await sendEmailViaResend({
+      to: email,
+      subject: "Your Mindspire digest",
+      text: body,
+    });
+    await logEvent(
+      getSupabaseAdminClient(),
+      "info",
+      "send_digest:email_sent",
+      { email, transport: "resend" },
+    );
+    return;
+  }
+
   const host = getOptionalEnv("SMTP_HOST");
   const portValue = getOptionalEnv("SMTP_PORT") ?? "465";
   const username = getOptionalEnv("SMTP_USER");
@@ -217,6 +234,7 @@ async function maybeSendEmail(email: string, body: string, dryRun: boolean) {
 
     await logEvent(getSupabaseAdminClient(), "info", "send_digest:email_sent", {
       email,
+      transport: "smtp",
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
