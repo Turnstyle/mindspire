@@ -91,3 +91,6 @@ enable_signup = false
 
 [functions.invite_link]
 verify_jwt = false
+
+[functions.auth_callback]
+verify_jwt = false
