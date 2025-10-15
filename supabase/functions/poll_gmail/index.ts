@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { jsonResponse } from "../_shared/http.ts";
 import { getSupabaseAdminClient } from "../_shared/supabaseClient.ts";
-import { logEvent } from "../_shared/logger.ts";
+import { logEvent, Logger } from "../_shared/logger.ts";
 import {
   getTokenPair,
   storeTokenPair,
@@ -69,6 +69,15 @@ const MessageSchema = z.object({
   }),
 });
 
+const MessageListSchema = z.object({
+  messages: z.array(z.object({
+    id: z.string(),
+    threadId: z.string(),
+  })).optional(),
+  nextPageToken: z.string().optional(),
+  resultSizeEstimate: z.number().optional(),
+});
+
 const HistoryResponseSchema = z.object({
   history: z.array(z.object({
     id: z.string(),
@@ -100,6 +109,7 @@ const GeminiInviteSchema = z.object({
 const BodySchema = z.object({
   userId: z.string().uuid().optional(),
   dryRun: z.boolean().optional(),
+  backfillDays: z.number().min(0).max(30).optional(),
 });
 
 function extractRecipientEmails(
@@ -202,8 +212,7 @@ async function fetchHistory(
   pageToken?: string,
 ) {
   const params = new URLSearchParams({
-    labelId: "INBOX",
-    maxResults: "25",
+    maxResults: "100",
   });
 
   if (startHistoryId) {
@@ -478,13 +487,160 @@ async function flagReauth(
   );
 }
 
+// Search Gmail messages for backfill functionality
+async function listRecentMessageIds(
+  accessToken: string,
+  days: number,
+  logger?: Logger,
+): Promise<Map<string, { id: string; threadId: string }>> {
+  const messageMap = new Map<string, { id: string; threadId: string }>();
+  if (days <= 0) {
+    logger?.warn('Invalid days parameter for Gmail search', {
+      source: 'gmail_api',
+      action: 'INVALID_DAYS_PARAM',
+      payload: { days }
+    });
+    return messageMap;
+  }
+
+  const queryParts = [
+    `newer_than:${days}d`,
+    // Removed "label:inbox" to search ALL_MAIL instead of just INBOX
+  ];
+  let pageToken: string | undefined;
+  let totalMessages = 0;
+  let pageCount = 0;
+
+  logger?.info('Starting Gmail API message search', {
+    source: 'gmail_api',
+    action: 'GMAIL_SEARCH_START',
+    payload: {
+      query: queryParts.join(" "),
+      days,
+      searchScope: 'ALL_MAIL'
+    }
+  });
+
+  do {
+    pageCount++;
+    const params = new URLSearchParams({
+      q: queryParts.join(" "),
+      maxResults: "100",
+    });
+    if (pageToken) {
+      params.set("pageToken", pageToken);
+    }
+
+    const url = `https://gmail.googleapis.com/gmail/v1/users/me/messages?${params.toString()}`;
+
+    logger?.info('Making Gmail API request', {
+      source: 'gmail_api',
+      action: 'GMAIL_API_REQUEST',
+      payload: {
+        url,
+        pageToken: pageToken || null,
+        pageNumber: pageCount
+      }
+    });
+
+    const startTime = Date.now();
+    const response = await gmailFetch(accessToken, url);
+    const durationMs = Date.now() - startTime;
+
+    logger?.info('Gmail API response received', {
+      source: 'gmail_api',
+      action: 'GMAIL_API_RESPONSE',
+      success: response.ok,
+      durationMs,
+      payload: {
+        status: response.status,
+        statusText: response.statusText,
+        pageNumber: pageCount
+      }
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      logger?.error('Gmail API request failed', new Error(`Failed to list messages: ${response.status} ${text}`), {
+        source: 'gmail_api',
+        action: 'GMAIL_API_ERROR',
+        durationMs,
+        payload: {
+          status: response.status,
+          responseBody: text,
+          url
+        }
+      });
+      throw new Error(`Failed to list messages: ${response.status} ${text}`);
+    }
+
+    const json = await response.json();
+    const parsed = MessageListSchema.parse(json);
+
+    const pageMessageCount = parsed.messages?.length || 0;
+    totalMessages += pageMessageCount;
+
+    logger?.info('Gmail API response parsed', {
+      source: 'gmail_api',
+      action: 'GMAIL_RESPONSE_PARSED',
+      success: true,
+      payload: {
+        pageMessageCount,
+        totalMessagesFound: totalMessages,
+        hasNextPage: !!parsed.nextPageToken,
+        pageNumber: pageCount
+      }
+    });
+
+    if (parsed.messages) {
+      for (const message of parsed.messages) {
+        messageMap.set(message.id, {
+          id: message.id,
+          threadId: message.threadId,
+        });
+      }
+    }
+
+    pageToken = parsed.nextPageToken ?? undefined;
+  } while (pageToken);
+
+  logger?.info('Gmail API search completed', {
+    source: 'gmail_api',
+    action: 'GMAIL_SEARCH_COMPLETE',
+    success: true,
+    payload: {
+      totalMessagesFound: totalMessages,
+      totalPagesProcessed: pageCount,
+      query: queryParts.join(" "),
+      searchDays: days
+    }
+  });
+
+  return messageMap;
+}
+
 async function processUser(
   supabase: ReturnType<typeof getSupabaseAdminClient>,
   user: UserRow,
   credential: CredentialRow,
   dryRun: boolean,
   userMap: Map<string, UserRow>,
+  correlationId?: string,
+  backfillDays?: number,
 ) {
+  const logger = new Logger('poll_gmail', correlationId);
+  
+  logger.info('Starting user processing', {
+    source: 'poll_gmail',
+    action: 'USER_PROCESSING_START',
+    payload: {
+      userId: user.id,
+      userEmail: user.email,
+      dryRun,
+      backfillDays
+    }
+  });
+
   const tokens = await getTokenPair(supabase, user.id).catch(() => ({
     accessToken: null,
     refreshToken: null,
@@ -492,6 +648,11 @@ async function processUser(
 
   const refreshToken = tokens.refreshToken;
   if (!refreshToken) {
+    logger.error('Missing refresh token for user', new Error('Refresh token missing'), {
+      source: 'token_management',
+      action: 'MISSING_REFRESH_TOKEN',
+      payload: { userId: user.id }
+    });
     await logEvent(supabase, "error", "poll_gmail:missing_refresh_token", {
       userId: user.id,
     });
@@ -555,6 +716,11 @@ async function processUser(
     historyMessages = await loadHistoryMessages();
   } catch (error) {
     if (error instanceof GoogleAuthError && error.status === 401) {
+      logger.warn('Token refresh needed for history loading', {
+        source: 'token_management',
+        action: 'TOKEN_REFRESH_HISTORY',
+        payload: { userId: user.id, errorStatus: 401 }
+      });
       const refreshed = await updateAccessToken(
         supabase,
         user.id,
@@ -565,8 +731,49 @@ async function processUser(
       activeRefreshToken = refreshed.refreshToken;
       historyMessages = await loadHistoryMessages();
     } else if (error instanceof GoogleAuthError && error.status === 404) {
+      logger.warn('History expired, cursor reset required', {
+        source: 'gmail_api',
+        action: 'HISTORY_EXPIRED',
+        payload: { userId: user.id, errorStatus: 404 }
+      });
       requiresCursorReset = true;
     } else {
+      throw error;
+    }
+  }
+
+  // Add backfill functionality when needed
+  if (backfillDays && backfillDays > 0) {
+    logger.info('Starting backfill process', {
+      source: 'gmail_api',
+      action: 'BACKFILL_START',
+      payload: { userId: user.id, backfillDays }
+    });
+    try {
+      const backfillMessages = await listRecentMessageIds(accessToken, backfillDays, logger);
+      logger.info('Backfill process completed successfully', {
+        source: 'gmail_api', 
+        action: 'BACKFILL_SUCCESS',
+        payload: { 
+          userId: user.id, 
+          backfillDays, 
+          messagesFound: backfillMessages.size 
+        }
+      });
+      // Merge backfill messages with history messages
+      if (historyMessages) {
+        for (const [id, message] of backfillMessages) {
+          historyMessages.set(id, message);
+        }
+      } else {
+        historyMessages = backfillMessages;
+      }
+    } catch (error) {
+      logger.error('Backfill process failed', error as Error, {
+        source: 'gmail_api',
+        action: 'BACKFILL_FAILURE',
+        payload: { userId: user.id, backfillDays }
+      });
       throw error;
     }
   }
@@ -769,6 +976,8 @@ async function processUser(
 
 export async function pollGmailHandler(req: Request): Promise<Response> {
   const supabase = getSupabaseAdminClient();
+  const correlationId = crypto.randomUUID();
+  const logger = new Logger('poll_gmail', correlationId);
 
   if (req.method !== "POST") {
     return jsonResponse({ error: "Method not allowed" }, { status: 405 });
@@ -781,6 +990,17 @@ export async function pollGmailHandler(req: Request): Promise<Response> {
   } catch (_error) {
     body = {};
   }
+
+  logger.info('Poll Gmail handler started', {
+    source: 'poll_gmail',
+    action: 'HANDLER_START',
+    payload: { 
+      method: req.method,
+      userId: body.userId,
+      dryRun: body.dryRun,
+      backfillDays: body.backfillDays
+    }
+  });
 
   await logEvent(supabase, "info", "poll_gmail:start", body);
 
@@ -860,6 +1080,8 @@ export async function pollGmailHandler(req: Request): Promise<Response> {
         credential as CredentialRow,
         !!body.dryRun,
         userMap,
+        correlationId,
+        body.backfillDays,
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
