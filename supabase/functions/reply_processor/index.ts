@@ -11,6 +11,11 @@ export const BodySchema = z.object({
   gmailMessageId: z.string().optional(),
   gmailThreadId: z.string().optional(),
   dryRun: z.boolean().optional(),
+  preprocessorConfidence: z.number().min(0).max(1).optional(),
+  htmlFormattingDetected: z.boolean().optional(),
+  preprocessedInviteId: z.string().min(1).optional(),
+  preprocessedDecision: z.enum(["yes", "no", "maybe"]).optional(),
+  preprocessedNotes: z.string().optional(),
 });
 
 export const GeminiReplySchema = z.object({
@@ -25,6 +30,18 @@ const DecisionToStatus: Record<"yes" | "no" | "maybe", string> = {
   maybe: "pending",
 };
 
+type InviteDecision = "yes" | "no" | "maybe";
+
+interface PeerNotificationPayload {
+  type: "invite_decision";
+  user_id: string;
+  invite_id: string;
+  decision: InviteDecision;
+  notes: string | null;
+  gmail_message_id: string | null;
+  gmail_thread_id: string | null;
+}
+
 export function buildReplyPrompt(emailText: string): string {
   return `Extract the invite decision and optional notes from this email reply.
 Return strict JSON with fields: id (string), decision (yes|no|maybe), notes (string, optional).
@@ -34,7 +51,21 @@ ${emailText}
 """`;
 }
 
-async function notifyPeer(body: Record<string, unknown>, dryRun: boolean) {
+async function notifyPeer(body: PeerNotificationPayload, dryRun: boolean) {
+  const webhookEnabled = getOptionalEnv("PEER_WEBHOOK_ENABLED") === "true";
+  if (!webhookEnabled) {
+    await logEvent(
+      getSupabaseAdminClient(),
+      "info",
+      "reply_processor:peer_notify_skipped",
+      {
+        inviteId: body.invite_id,
+        userId: body.user_id,
+      },
+    );
+    return;
+  }
+
   const webhook = getOptionalEnv("PEER_WEBHOOK_URL");
   if (!webhook) {
     return;
@@ -47,18 +78,65 @@ async function notifyPeer(body: Record<string, unknown>, dryRun: boolean) {
     return;
   }
 
+  const isSlackWebhook = webhook.includes("hooks.slack.com");
+  const payload = isSlackWebhook
+    ? buildSlackPayload(body)
+    : body;
+
   const response = await fetch(webhook, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify(payload),
   });
 
   if (!response.ok) {
     const text = await response.text();
     throw new Error(`Peer webhook failed: ${response.status} ${text}`);
   }
+}
+
+function buildSlackPayload(body: PeerNotificationPayload): Record<string, unknown> {
+  const baseSummary = [
+    `*Invite*: ${body.invite_id}`,
+    `*Decision*: ${body.decision.toUpperCase()}`,
+    `*User ID*: ${body.user_id}`,
+  ];
+
+  if (body.notes) {
+    baseSummary.push(`*Notes*: ${body.notes}`);
+  }
+
+  const threadLine = [
+    body.gmail_thread_id ? `<https://mail.google.com/mail/u/0/#inbox/${body.gmail_thread_id}|Thread>` : "Thread: —",
+    body.gmail_message_id ? `Message: ${body.gmail_message_id}` : null,
+  ]
+    .filter(Boolean)
+    .join(" | ");
+
+  const contextElements = threadLine
+    ? [{ type: "mrkdwn", text: threadLine }]
+    : [];
+
+  return {
+    text: `Invite ${body.invite_id}: ${body.decision}`,
+    blocks: [
+      {
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: baseSummary.join("\n"),
+        },
+      },
+      ...(contextElements.length > 0
+        ? [{
+          type: "context",
+          elements: contextElements,
+        }]
+        : []),
+    ],
+  };
 }
 
 export async function replyProcessorHandler(req: Request): Promise<Response> {
@@ -87,22 +165,34 @@ export async function replyProcessorHandler(req: Request): Promise<Response> {
   });
 
   let parsedReply: z.infer<typeof GeminiReplySchema>;
-  try {
-    const prompt = buildReplyPrompt(body.emailText);
-    parsedReply = await callGeminiJson(prompt, GeminiReplySchema);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await logEvent(supabase, "error", "reply_processor:gemini_failed", {
-      userId: body.userId,
-      error: message,
-    });
-    return jsonResponse({ error: "Failed to parse reply" }, { status: 502 });
+  let usedPreprocessed = false;
+
+  if (body.preprocessedInviteId && body.preprocessedDecision) {
+    parsedReply = {
+      id: body.preprocessedInviteId,
+      decision: body.preprocessedDecision,
+      notes: body.preprocessedNotes ?? undefined,
+    };
+    usedPreprocessed = true;
+  } else {
+    try {
+      const prompt = buildReplyPrompt(body.emailText);
+      parsedReply = await callGeminiJson(prompt, GeminiReplySchema);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await logEvent(supabase, "error", "reply_processor:gemini_failed", {
+        userId: body.userId,
+        error: message,
+      });
+      return jsonResponse({ error: "Failed to parse reply" }, { status: 502 });
+    }
   }
 
   if (body.dryRun) {
     await logEvent(supabase, "info", "reply_processor:dry_run", {
       userId: body.userId,
       parsedReply,
+      usedPreprocessed,
     });
     return jsonResponse({ message: "Dry run", parsedReply });
   }
@@ -143,6 +233,14 @@ export async function replyProcessorHandler(req: Request): Promise<Response> {
     notes: parsedReply.notes ?? null,
   };
 
+  if (body.preprocessorConfidence !== undefined) {
+    updatedFields.preprocessor_confidence = body.preprocessorConfidence;
+  }
+
+  if (body.htmlFormattingDetected !== undefined) {
+    updatedFields.html_formatting_detected = body.htmlFormattingDetected;
+  }
+
   const { error: updateError } = await supabase
     .from("invite")
     .update(updatedFields)
@@ -180,6 +278,7 @@ export async function replyProcessorHandler(req: Request): Promise<Response> {
     userId: body.userId,
     inviteId: invite.id,
     decision: parsedReply.decision,
+    usedPreprocessed,
   });
 
   return jsonResponse({

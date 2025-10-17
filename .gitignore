@@ -11,3 +11,12 @@ node_modules/
 # Supabase artifacts
 .supabase/
 supabase/.temp/
+
+# Local debug artifacts
+temp_*.sql
+check_invites.sql
+test_vertex_ai.js
+test_specific_senders.js
+supabase/functions/poll_gmail_debug/
+supabase/functions/test_html/
+httpshzrmmunlgcjghjrjouxa.supabase.cofunctionsv1auth_callbackstate=*.jpeg

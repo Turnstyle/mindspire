@@ -78,4 +78,7 @@ Deno.test("buildDigestBody composes items", () => {
   assertStringIncludes(digest.text, "Email thread:");
   assertEquals(digest.items.length, 1);
   assertEquals(digest.items[0].invite_id, "1A");
+  assertEquals(digest.items[0].letter, "A");
+  assertEquals(digest.letterMapping.A, "1A");
+  assertEquals(digest.letterMapping["INVITE A"], "1A");
 });

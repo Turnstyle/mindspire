@@ -91,9 +91,14 @@ export function buildDigestBody(
     { record: InviteRecord; parsed: z.infer<typeof InviteSchema> }
   >,
   ownerEmailLookup: Map<string, string>,
-): { text: string; items: Array<Record<string, unknown>> } {
+): {
+  text: string;
+  items: Array<Record<string, unknown>>;
+  letterMapping: Record<string, string>;
+} {
   const lines: string[] = [];
   const items: Array<Record<string, unknown>> = [];
+  const letterMapping: Record<string, string> = {};
 
   lines.push(`Good morning ${user.email},`);
   lines.push("");
@@ -105,7 +110,8 @@ export function buildDigestBody(
       .map((slot) => formatTimeRange(slot.start, slot.end, slot.timezone))
       .filter((value) => Boolean(value));
 
-    const header = `${String.fromCharCode(65 + index)}. ${parsed.title}`;
+    const letter = String.fromCharCode(65 + index);
+    const header = `${letter}. ${parsed.title}`;
     lines.push(header);
 
     const meta: string[] = [];
@@ -132,7 +138,13 @@ export function buildDigestBody(
 
     lines.push("");
 
+    const inviteId = parsed.invite_id;
+    const normalizedInviteId = inviteId.trim();
+    letterMapping[letter] = normalizedInviteId;
+    letterMapping[`INVITE ${letter}`] = normalizedInviteId;
+
     items.push({
+      letter,
       invite_id: parsed.invite_id,
       gmail_thread_id: record.gmail_thread_id,
       gmail_message_id: record.gmail_message_id,
@@ -143,7 +155,7 @@ export function buildDigestBody(
 
   lines.push("Reply yes/no/maybe with notes to act on these invites.");
 
-  return { text: lines.join("\n"), items };
+  return { text: lines.join("\n"), items, letterMapping };
 }
 
 async function deliverDigest(
@@ -152,7 +164,11 @@ async function deliverDigest(
   dryRun: boolean,
 ) {
   const webhook = getOptionalEnv("DIGEST_WEBHOOK_URL");
-  if (webhook) {
+  if (webhook && !dryRun) {
+    console.info("Digest webhook temporarily disabled; skipping external post", {
+      email,
+    });
+    /*
     const payload = webhook.includes("hooks.slack.com")
       ? { text: `*Mindspire digest for ${email}*\n\n${body}` }
       : { email, body };
@@ -173,7 +189,8 @@ async function deliverDigest(
     await logEvent(getSupabaseAdminClient(), "info", "send_digest:slack_posted", {
       email,
     });
-  } else if (!dryRun) {
+    */
+  } else if (!webhook && !dryRun) {
     console.warn("DIGEST_WEBHOOK_URL not configured; skipping Slack post", { email });
   }
 
@@ -395,21 +412,46 @@ export async function sendDigestHandler(req: Request): Promise<Response> {
 
       const digestToken = crypto.randomUUID();
 
+      const insertPayload = {
+        user_id: user.id,
+        sent_at: now.toUTC().toISO(),
+        token: digestToken,
+        items: digestBody.items,
+        letter_mapping: digestBody.letterMapping,
+      };
+
       const { error: digestInsertError } = await supabase
         .from("digest")
-        .insert({
-          user_id: user.id,
-          sent_at: now.toUTC().toISO(),
-          token: digestToken,
-          items: digestBody.items,
-        });
+        .insert(insertPayload);
 
       if (digestInsertError) {
-        await logEvent(supabase, "error", "send_digest:digest_insert_failed", {
-          userId: user.id,
-          error: digestInsertError.message,
-        });
-        continue;
+        const missingLetterMapping = typeof digestInsertError.message === "string" &&
+          digestInsertError.message.includes("letter_mapping");
+
+        if (missingLetterMapping) {
+          const { letter_mapping: _omit, ...legacyPayload } = insertPayload;
+          const { error: legacyInsertError } = await supabase
+            .from("digest")
+            .insert(legacyPayload);
+
+          if (legacyInsertError) {
+            await logEvent(supabase, "error", "send_digest:digest_insert_failed", {
+              userId: user.id,
+              error: legacyInsertError.message,
+            });
+            continue;
+          }
+
+          await logEvent(supabase, "warn", "send_digest:digest_insert_legacy", {
+            userId: user.id,
+          });
+        } else {
+          await logEvent(supabase, "error", "send_digest:digest_insert_failed", {
+            userId: user.id,
+            error: digestInsertError.message,
+          });
+          continue;
+        }
       }
     }
 

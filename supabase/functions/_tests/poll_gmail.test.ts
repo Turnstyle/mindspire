@@ -1,9 +1,9 @@
 import { assertEquals } from "@std/assert";
+import { buildInvitePrompt } from "../poll_gmail/index.ts";
 import {
-  buildInvitePrompt,
   decodeBase64Url,
   extractPlainText,
-} from "../poll_gmail/index.ts";
+} from "../_shared/gmail.ts";
 
 Deno.test("decodeBase64Url decodes url-safe base64", () => {
   const original = "Hello, Mindspire!";

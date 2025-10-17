@@ -7,7 +7,8 @@ import {
   storeTokenPair,
 } from "../_shared/tokenStore.ts";
 import { callGeminiJson, refreshAccessToken } from "../_shared/google.ts";
-import { getOptionalEnv } from "../_shared/env.ts";
+import { getOptionalEnv, getRequiredEnv } from "../_shared/env.ts";
+import { extractPlainText, extractHtml } from "../_shared/gmail.ts";
 
 interface CredentialRow {
   id: string;
@@ -23,6 +24,12 @@ interface UserRow {
   email: string;
   tz: string;
   partner_user_id: string | null;
+}
+
+interface MessageReference {
+  id: string;
+  threadId: string;
+  labelIds?: string[] | null;
 }
 
 class GoogleAuthError extends Error {
@@ -55,6 +62,7 @@ const MessageSchema = z.object({
   id: z.string(),
   threadId: z.string(),
   snippet: z.string().optional(),
+  labelIds: z.array(z.string()).optional(),
   payload: z.object({
     mimeType: z.string(),
     body: z.object({
@@ -73,9 +81,23 @@ const MessageListSchema = z.object({
   messages: z.array(z.object({
     id: z.string(),
     threadId: z.string(),
+    labelIds: z.array(z.string()).optional(),
   })).optional(),
   nextPageToken: z.string().optional(),
   resultSizeEstimate: z.number().optional(),
+});
+
+const ThreadSchema = z.object({
+  id: z.string(),
+  historyId: z.string().optional(),
+  messages: z.array(MessageSchema).optional(),
+  snippet: z.string().optional(),
+});
+
+const HistoryMessageSchema = z.object({
+  id: z.string(),
+  threadId: z.string(),
+  labelIds: z.array(z.string()).optional(),
 });
 
 const HistoryResponseSchema = z.object({
@@ -84,6 +106,9 @@ const HistoryResponseSchema = z.object({
     messages: z.array(z.object({
       id: z.string(),
       threadId: z.string(),
+    })).optional(),
+    messagesAdded: z.array(z.object({
+      message: HistoryMessageSchema,
     })).optional(),
   })).optional(),
   historyId: z.string().optional(),
@@ -132,45 +157,16 @@ function extractRecipientEmails(
   return recipients;
 }
 
-export function decodeBase64Url(input: string | undefined): string {
-  if (!input) return "";
-  const normalized = input.replace(/-/g, "+").replace(/_/g, "/");
-  const padded = normalized.padEnd(
-    normalized.length + (4 - normalized.length % 4) % 4,
-    "=",
-  );
-  try {
-    return new TextDecoder("utf-8").decode(
-      Uint8Array.from(atob(padded), (c) => c.charCodeAt(0)),
-    );
-  } catch (_error) {
-    return "";
-  }
-}
-
-export function extractPlainText(
-  payload: z.infer<typeof MessageSchema>["payload"],
+function getHeaderValue(
+  headers: Array<{ name: string; value: string }> | undefined,
+  target: string,
 ): string {
-  if (payload.body?.data) {
-    return decodeBase64Url(payload.body.data);
-  }
-
-  if (payload.parts) {
-    for (const part of payload.parts) {
-      if (part.mimeType === "text/plain" && part.body?.data) {
-        const text = decodeBase64Url(part.body.data);
-        if (text.trim()) return text;
-      }
-    }
-
-    return payload.parts
-      .map((part) => part.body?.data ? decodeBase64Url(part.body.data) : "")
-      .filter(Boolean)
-      .join("\n");
-  }
-
-  return "";
+  if (!headers) return "";
+  const lowerTarget = target.toLowerCase();
+  const match = headers.find((header) => header.name.toLowerCase() === lowerTarget);
+  return match?.value ?? "";
 }
+
 
 async function gmailFetch(
   accessToken: string,
@@ -206,6 +202,19 @@ async function fetchMessage(accessToken: string, messageId: string) {
   return MessageSchema.parse(json);
 }
 
+async function fetchThread(accessToken: string, threadId: string) {
+  const url =
+    `https://gmail.googleapis.com/gmail/v1/users/me/threads/${threadId}?format=full`;
+  const response = await gmailFetch(accessToken, url);
+
+  if (!response.ok) {
+    throw new Error(`Failed to fetch thread ${threadId}: ${response.status}`);
+  }
+
+  const json = await response.json();
+  return ThreadSchema.parse(json);
+}
+
 async function fetchHistory(
   accessToken: string,
   startHistoryId?: string | null,
@@ -222,6 +231,8 @@ async function fetchHistory(
   if (pageToken) {
     params.set("pageToken", pageToken);
   }
+
+  params.set("historyTypes", "messageAdded");
 
   const url =
     `https://gmail.googleapis.com/gmail/v1/users/me/history?${params.toString()}`;
@@ -338,6 +349,80 @@ async function parseInviteWithGemini(
 ) {
   const prompt = buildInvitePrompt(emailText, userEmail);
   return await callGeminiJson(prompt, GeminiInviteSchema);
+}
+
+interface DigestReplyParams {
+  supabase: ReturnType<typeof getSupabaseAdminClient>;
+  userId: string;
+  emailText: string;
+  emailHtml: string;
+  gmailMessageId: string;
+  gmailThreadId: string;
+  dryRun: boolean;
+}
+
+async function forwardDigestReply({
+  supabase,
+  userId,
+  emailText,
+  emailHtml,
+  gmailMessageId,
+  gmailThreadId,
+  dryRun,
+}: DigestReplyParams) {
+  const supabaseUrl = getRequiredEnv("SUPABASE_URL");
+  const serviceRoleKey = getRequiredEnv("SUPABASE_SERVICE_ROLE_KEY");
+
+  const response = await fetch(
+    `${supabaseUrl}/functions/v1/reply_preprocessor`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${serviceRoleKey}`,
+        apikey: serviceRoleKey,
+      },
+      body: JSON.stringify({
+        userId,
+        emailText,
+        emailHtml,
+        gmailMessageId,
+        gmailThreadId,
+        dryRun,
+      }),
+    },
+  );
+
+  const payload = await safeParseJson(response);
+
+  if (!response.ok) {
+    await logEvent(supabase, "error", "poll_gmail:reply_preprocessor_failed", {
+      userId,
+      gmailMessageId,
+      status: response.status,
+      body: payload,
+    });
+    throw new Error(
+      `reply_preprocessor returned ${response.status}`,
+    );
+  }
+
+  await logEvent(supabase, "info", "poll_gmail:reply_preprocessor_success", {
+    userId,
+    gmailMessageId,
+    dryRun,
+    decisionsProcessed: typeof payload === "object" && payload !== null
+      ? (payload as Record<string, unknown>).decisionsProcessed ?? null
+      : null,
+  });
+}
+
+async function safeParseJson(response: Response): Promise<unknown> {
+  try {
+    return await response.json();
+  } catch (_error) {
+    return null;
+  }
 }
 
 async function updateAccessToken(
@@ -492,8 +577,8 @@ async function listRecentMessageIds(
   accessToken: string,
   days: number,
   logger?: Logger,
-): Promise<Map<string, { id: string; threadId: string }>> {
-  const messageMap = new Map<string, { id: string; threadId: string }>();
+): Promise<Map<string, MessageReference>> {
+  const messageMap = new Map<string, MessageReference>();
   if (days <= 0) {
     logger?.warn('Invalid days parameter for Gmail search', {
       source: 'gmail_api',
@@ -527,6 +612,7 @@ async function listRecentMessageIds(
       q: queryParts.join(" "),
       maxResults: "100",
     });
+    params.set("fields", "messages(id,threadId,labelIds),nextPageToken");
     if (pageToken) {
       params.set("pageToken", pageToken);
     }
@@ -597,6 +683,7 @@ async function listRecentMessageIds(
         messageMap.set(message.id, {
           id: message.id,
           threadId: message.threadId,
+          labelIds: message.labelIds ?? [],
         });
       }
     }
@@ -675,12 +762,12 @@ async function processUser(
   let accessToken = ensured.accessToken;
   let activeRefreshToken = ensured.refreshToken;
 
-  let historyMessages: Map<string, { id: string; threadId: string }> | null = null;
+  let historyMessages: Map<string, MessageReference> | null = null;
   let latestHistoryId: string | null = credential.last_history_id ?? null;
   let requiresCursorReset = false;
 
   const loadHistoryMessages = async () => {
-    const messageMap = new Map<string, { id: string; threadId: string }>();
+    const messageMap = new Map<string, MessageReference>();
     let pageToken: string | undefined;
 
     do {
@@ -692,12 +779,40 @@ async function processUser(
 
       if (page.history) {
         for (const history of page.history) {
-          if (!history.messages) continue;
-          for (const message of history.messages) {
-            messageMap.set(message.id, {
-              id: message.id,
-              threadId: message.threadId,
-            });
+          if (history.messagesAdded) {
+            for (const entry of history.messagesAdded) {
+              const historyMessage = entry.message;
+              if (!historyMessage) continue;
+              if (historyMessage.id === historyMessage.threadId) {
+                continue;
+              }
+              const labels = historyMessage.labelIds ?? [];
+              if (labels.includes("DRAFT") || labels.includes("CHAT")) {
+                continue;
+              }
+
+              if (!messageMap.has(historyMessage.id)) {
+                messageMap.set(historyMessage.id, {
+                  id: historyMessage.id,
+                  threadId: historyMessage.threadId,
+                  labelIds: labels,
+                });
+              }
+            }
+          }
+
+          if (history.messages) {
+            for (const message of history.messages) {
+              if (message.id === message.threadId) {
+                continue;
+              }
+              if (!messageMap.has(message.id)) {
+                messageMap.set(message.id, {
+                  id: message.id,
+                  threadId: message.threadId,
+                });
+              }
+            }
           }
         }
       }
@@ -823,15 +938,121 @@ async function processUser(
     ? userMap.get(user.partner_user_id) ?? null
     : null;
 
-  for (const { id: messageId, threadId } of historyMessages.values()) {
+  for (const { id: messageId, threadId, labelIds } of historyMessages.values()) {
     try {
-      const message = await fetchMessage(accessToken, messageId);
+      let message: z.infer<typeof MessageSchema>;
+      try {
+        message = await fetchMessage(accessToken, messageId);
+      } catch (error) {
+        const isNotFound = error instanceof Error &&
+          error.message.includes("404");
+        if (!isNotFound) {
+          throw error;
+        }
+
+        try {
+          const thread = await fetchThread(accessToken, threadId);
+          const fallback = thread.messages?.find((msg) =>
+            msg.id === messageId
+          ) ??
+            thread.messages?.find((msg) =>
+              (msg.labelIds ?? []).includes("SENT")
+            );
+
+          if (!fallback) {
+            await logEvent(supabase, "warn", "poll_gmail:thread_fallback_missing", {
+              userId: user.id,
+              messageId,
+              threadId,
+            });
+            continue;
+          }
+
+          message = fallback;
+          await logEvent(supabase, "info", "poll_gmail:thread_fallback_used", {
+            userId: user.id,
+            messageId,
+            threadId,
+            labelIds: message.labelIds ?? [],
+          });
+        } catch (threadError) {
+          const message = threadError instanceof Error
+            ? threadError.message
+            : String(threadError);
+          await logEvent(supabase, "error", "poll_gmail:thread_fetch_failed", {
+            userId: user.id,
+            messageId,
+            threadId,
+            labelIds,
+            error: message,
+          });
+          continue;
+        }
+      }
       let emailText = extractPlainText(message.payload);
-      if (!emailText.trim()) {
-        emailText = message.snippet ?? "";
+      const emailHtml = extractHtml(message.payload);
+
+      const combinedLabelSet = new Set<string>([
+        ...(labelIds ?? []),
+        ...((message.labelIds ?? [])),
+      ]);
+
+      if (combinedLabelSet.has("DRAFT") || combinedLabelSet.has("CHAT")) {
+        await logEvent(supabase, "debug", "poll_gmail:skipped_draft_or_chat", {
+          userId: user.id,
+          messageId,
+          labels: Array.from(combinedLabelSet),
+        });
+        continue;
       }
 
       if (!emailText.trim()) {
+        if (message.snippet?.trim()) {
+          emailText = message.snippet;
+        } else if (emailHtml.trim()) {
+          emailText = emailHtml;
+        }
+      }
+
+      const subjectRaw = getHeaderValue(message.payload.headers, "subject");
+      const fromRaw = getHeaderValue(message.payload.headers, "from").toLowerCase();
+      const toRaw = getHeaderValue(message.payload.headers, "to").toLowerCase();
+      const userEmailLower = user.email.toLowerCase();
+      const isFromUser = fromRaw.includes(userEmailLower);
+      const isDigestReply = subjectRaw.toLowerCase().includes("mindspire digest");
+      const isDigestRecipient = toRaw.includes("notifications@send.mind-spire.xyz");
+      const isSentMessage = combinedLabelSet.has("SENT");
+
+      if (isFromUser && isSentMessage) {
+        await logEvent(supabase, "info", "poll_gmail:user_sent_message", {
+          userId: user.id,
+          messageId,
+          threadId,
+          subject: subjectRaw,
+          to: toRaw,
+          labels: Array.from(combinedLabelSet),
+          digestReplyCandidate: isDigestReply || isDigestRecipient,
+        });
+      }
+
+      if ((isDigestReply || isDigestRecipient) && isFromUser && isSentMessage) {
+        await forwardDigestReply({
+          supabase,
+          userId: user.id,
+          emailText,
+          emailHtml,
+          gmailMessageId: messageId,
+          gmailThreadId: threadId,
+          dryRun,
+        });
+        continue;
+      }
+
+      if (!emailText.trim()) {
+        continue;
+      }
+
+      if (isFromUser) {
         continue;
       }
 
@@ -840,9 +1061,7 @@ async function processUser(
         continue;
       }
 
-      const subject = message.payload.headers?.find((header) =>
-        header.name.toLowerCase() === "subject"
-      )?.value ?? invite.title;
+      const subject = subjectRaw || invite.title;
 
       const recipients = extractRecipientEmails(message.payload.headers);
       const sharedUserIds = new Set<string>();
